@@ -1,0 +1,54 @@
+{
+  "name": "create-lark-bot",
+  "version": "0.1.0",
+  "description": "Create a fully-configured Feishu/Lark bot app with just two QR scans: device-flow app creation + Open Platform auto-configuration (scopes incl. VC meeting bot, event subscriptions, redirect URL, version publish).",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "create-lark-bot": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm build && pnpm test"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "bot",
+    "open-platform",
+    "qrcode",
+    "vc",
+    "meeting-bot"
+  ],
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "pnpm": {
+    "ignoredBuiltDependencies": [
+      "protobufjs"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.3.0",
+    "vitest": "^4.0.18"
+  }
+}
