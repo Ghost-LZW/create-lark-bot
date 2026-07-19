@@ -13,6 +13,9 @@
  * - 建出来的应用没有声明任何 scope；配合 {@link configureOpenPlatformApp}
  *   自动导入（第二个二维码 / 复用缓存 session 时 0 扫码）。
  * - secret 永远不打印; 错误只暴露 error code / 阶段标签, 不暴露 secret。
+ *
+ * 实现源自 botmux（https://github.com/deepcoldy/botmux，MIT）的
+ * src/setup/register-app.ts。
  */
 import { registerApp } from '@larksuiteoapi/node-sdk';
 import qrcode from 'qrcode-terminal';

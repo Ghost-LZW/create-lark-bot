@@ -5,6 +5,9 @@
  * → 终端渲染二维码 → 轮询 `/accounts/qrlogin/polling` → 跟随 cross-login URI
  * → 把 cookie jar 私有落盘（0600）。落盘后的 session 可复用——同一台机器
  * 再建 bot 时无需再次扫码。
+ *
+ * 实现源自 botmux（https://github.com/deepcoldy/botmux，MIT）的
+ * src/setup/open-platform-automation.ts。
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';

@@ -1,6 +1,8 @@
 # create-lark-bot
 
-最多**两次扫码**创建一个配置完整的飞书（Lark）bot 应用——从 botmux 的建 bot 流程抽出的独立库。
+最多**两次扫码**创建一个配置完整的飞书（Lark）bot 应用。
+
+> 本库基于 [botmux](https://github.com/deepcoldy/botmux)（MIT License）的建 bot 流程抽取而来——扫码建应用（Device Flow）、飞书 Web 登录态、开放平台自动配置等核心实现均源自 botmux 的 `src/setup/` 模块，在此致谢。
 
 - **扫码① 建应用**：OAuth 2.0 Device Flow（`@larksuiteoapi/node-sdk` 的 `registerApp`），终端二维码扫一下即拿到 AppID/AppSecret，自动识别飞书 / Lark 国际版租户
 - **扫码② 自动配置**：飞书 Web 扫码登录后调开放平台 console 接口，自动完成：

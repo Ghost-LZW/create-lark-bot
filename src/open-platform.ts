@@ -5,6 +5,9 @@
  * 仅支持飞书（feishu.cn）租户——Lark 国际版 console 机制不同。
  * 权限注册是非致命步骤：个别租户对部分权限有目录限制导致整批被拒时，
  * 只记 warning 并继续完成 redirect / 版本发布，不阻塞建 bot。
+ *
+ * 实现源自 botmux（https://github.com/deepcoldy/botmux，MIT）的
+ * src/setup/open-platform-automation.ts。
  */
 import {
   MutableCookieJar,

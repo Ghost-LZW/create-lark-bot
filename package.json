@@ -1,9 +1,18 @@
 {
   "name": "create-lark-bot",
   "version": "0.1.0",
-  "description": "Create a fully-configured Feishu/Lark bot app with just two QR scans: device-flow app creation + Open Platform auto-configuration (scopes incl. VC meeting bot, event subscriptions, redirect URL, version publish).",
+  "description": "Create a fully-configured Feishu/Lark bot app with just two QR scans: device-flow app creation + Open Platform auto-configuration (scopes incl. VC meeting bot, event subscriptions, redirect URL, version publish). Extracted from botmux.",
   "type": "module",
   "license": "MIT",
+  "author": "Ghost-LZW",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ghost-LZW/create-lark-bot.git"
+  },
+  "homepage": "https://github.com/Ghost-LZW/create-lark-bot#readme",
+  "bugs": {
+    "url": "https://github.com/Ghost-LZW/create-lark-bot/issues"
+  },
   "bin": {
     "create-lark-bot": "dist/cli.js"
   },
