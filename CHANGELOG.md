@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+### Added
+
+- `--qr-out <file>`: also write the QR contents (web login payload or device-flow URL) to a 0600 file, for environments that cannot show a terminal QR code.
+
 ## 0.2.1
 
 ### Fixed

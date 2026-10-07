@@ -69,6 +69,22 @@ describe('runCli', () => {
     }
   });
 
+  it('--qr-out writes the login and device-flow QR contents to a 0600 file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
+    const qr = join(dir, 'qr.txt');
+    const create = vi.fn(async (opts: any) => {
+      await opts.session.onQrCode({ qrText: '[qr]', qrPayload: 'login-payload' });
+      expect(readFileSync(qr, 'utf8')).toBe('login-payload\n');
+      opts.register.onQRCodeReady({ url: 'https://accounts.example/verify?code=1', expireIn: 600 });
+      return created;
+    });
+    const t = io({ createLarkBot: create });
+    await runCli(['--out', join(dir, 'a.json'), '--qr-out', qr], t.io);
+    expect(readFileSync(qr, 'utf8')).toBe('https://accounts.example/verify?code=1\n');
+    expect(statSync(qr).mode & 0o777).toBe(0o600);
+    expect(t.err.join('\n')).toContain('[qr]');
+  });
+
   it('prints the secret only with --print-secret', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
     const t = io({ createLarkBot: vi.fn().mockResolvedValue(created) });

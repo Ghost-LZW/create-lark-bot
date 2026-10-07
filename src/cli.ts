@@ -12,7 +12,7 @@
  * Secrets are never printed (unless --print-secret) nor included in --json output.
  */
 import { createInterface } from 'node:readline/promises';
-import { realpathSync } from 'node:fs';
+import { realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createLarkBot, updateLarkBot, type CreateLarkBotResult, type UpdateLarkBotResult } from './create-bot.js';
@@ -41,6 +41,7 @@ export interface CliArgs {
   switchAccount: boolean;
   noQr: boolean;
   sessionFile?: string;
+  qrOut?: string;
   out?: string;
   writeEnv?: string;
   envOwnerVar?: string;
@@ -111,6 +112,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
       case '--switch-account': args.switchAccount = true; break;
       case '--no-qr': args.noQr = true; break;
       case '--session-file': args.sessionFile = value(arg); break;
+      case '--qr-out': args.qrOut = value(arg); break;
       case '--out': case '--write-credentials': args.out = value(arg); break;
       case '--write-env': args.writeEnv = value(arg); break;
       case '--env-owner-var': args.envOwnerVar = value(arg); break;
@@ -152,6 +154,7 @@ export const HELP = `create-lark-bot — 一次扫码创建 / 更新 / 校验飞
   --switch-account        忽略缓存登录态，重新扫码（换账号）
   --no-qr                 只复用缓存登录态，绝不弹二维码
   --session-file <file>   Web 登录态缓存（默认 ~/.lark-bot/web-session.json，0600）
+  --qr-out <file>         另把二维码内容写入文件（0600），供无法显示终端二维码的环境自行渲染
 
 权限 / 事件:
   --preset a,b            组合 preset（${PRESET_NAMES.join(', ')}）；默认 messaging,contact,selfManage,vcMeeting,userLogin
@@ -282,7 +285,26 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
     ...(args.switchAccount ? { forceQrLogin: true } : {}),
     ...(args.noQr ? { disableQrLogin: true } : {}),
     onStatus: (m: string) => io.err(`   ${m}`),
+    ...(args.qrOut
+      ? {
+          onQrCode: (info: { qrText: string; qrPayload: string }) => {
+            io.err('\n请用飞书 App 扫码登录飞书开放平台（创建 / 配置应用只需这一次）：\n');
+            io.err(info.qrText);
+            writeQrOut(args.qrOut!, info.qrPayload);
+            io.err(`二维码内容已写入 ${args.qrOut}`);
+          },
+        }
+      : {}),
   };
+  const register = args.qrOut
+    ? {
+        onQRCodeReady: (info: { url: string; expireIn: number }) => {
+          io.err(`\n请用飞书 App 扫码完成应用创建：\n  ${info.url}`);
+          writeQrOut(args.qrOut!, info.url);
+          io.err(`二维码内容已写入 ${args.qrOut}`);
+        },
+      }
+    : undefined;
   const identity = {
     ...(args.name !== undefined ? { name: args.name } : {}),
     ...(args.desc !== undefined ? { description: args.desc } : {}),
@@ -339,7 +361,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
       ...(Object.keys(identity).length ? { identity } : {}),
       ...(presets ? { presets } : {}),
       session,
-      register: { signal: ac.signal },
+      register: { signal: ac.signal, ...register },
       configure,
       autoConfigure: args.configure,
       resolveOwner: args.owner,
@@ -367,7 +389,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
     fallbackToSdk: args.fallback,
     ...(presets ? { presets } : {}),
     session,
-    register: { signal: ac.signal },
+    register: { signal: ac.signal, ...register },
     configure,
     autoConfigure: args.configure,
     resolveOwner: args.owner,
@@ -450,4 +472,8 @@ if (isMain()) {
       process.exitCode = 1;
     })
     .finally(() => rl?.close());
+}
+
+function writeQrOut(path: string, payload: string): void {
+  writeFileSync(resolve(path), payload + '\n', { encoding: 'utf-8', mode: 0o600 });
 }
