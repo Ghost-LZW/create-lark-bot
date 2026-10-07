@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+### Added
+
+- `--env-prefix <P>` (with `--write-env`): write `<P>APP_ID` / `<P>APP_SECRET` / `<P>DOMAIN` instead of `LARK_*`. `P` must match `^[A-Z_][A-Z0-9_]*$`. Works for `create`, `update` and `verify` (which reads env with that prefix). Without it, behaviour is unchanged.
+- `--json` result gains `envVars` (the variable names written) next to `envFile`.
+- In `--json` mode, invalid arguments now also print `{ "ok": false, "stage": "args", "error": "invalid_args", "message": ... }` on stdout (exit 2).
+
 ## 0.2.3
 
 ### Changed

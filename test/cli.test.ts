@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -67,6 +67,33 @@ describe('runCli', () => {
       expect(statSync(env).mode & 0o777).toBe(0o600);
       expect(statSync(out).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it('--env-prefix writes <P>APP_ID/<P>APP_SECRET/<P>DOMAIN and --json reports envVars; update supports it too', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
+    const env = join(dir, '.env');
+    writeFileSync(env, 'LARK_APP_ID=keep\n');
+    const t = io({ createLarkBot: vi.fn().mockResolvedValue(created) });
+    expect(await runCli(['--json', '--write-env', env, '--env-prefix', 'BOT_B_'], t.io)).toBe(0);
+    expect(readFileSync(env, 'utf-8')).toBe(`LARK_APP_ID=keep\nBOT_B_APP_ID=cli_c\nBOT_B_APP_SECRET=${SECRET}\nBOT_B_DOMAIN=feishu\n`);
+    expect(JSON.parse(t.out[0])).toMatchObject({ envFile: env, envVars: ['BOT_B_APP_ID', 'BOT_B_APP_SECRET', 'BOT_B_DOMAIN'] });
+    const u = io({ updateLarkBot: vi.fn().mockResolvedValue(created) });
+    expect(await runCli(['update', '--app-id', 'cli_c', '--json', '--write-env', env, '--env-prefix', 'BOT_C_'], u.io)).toBe(0);
+    expect(readFileSync(env, 'utf-8')).toContain('BOT_C_APP_ID=cli_c');
+    const v = vi.fn().mockResolvedValue({ appId: 'cli_c', brand: 'lark', ok: true, checks: [], missingScopes: [], scopesJson: {}, links: {} });
+    const w = io({ verifyLarkBot: v, env: { BOT_B_APP_ID: 'cli_c', BOT_B_APP_SECRET: SECRET, BOT_B_DOMAIN: 'lark' } });
+    expect(await runCli(['verify', '--json', '--env-prefix', 'BOT_B_'], w.io)).toBe(0);
+    expect(v.mock.calls[0][0]).toMatchObject({ appId: 'cli_c', appSecret: SECRET, brand: 'lark' });
+  });
+
+  it('--env-prefix rejects invalid values (exit 2, JSON error in --json mode) and requires --write-env', async () => {
+    for (const bad of ['lark_', '1X', 'A-B', '']) {
+      const t = io({ createLarkBot: vi.fn() });
+      expect(await runCli(['--json', '--write-env', '.env', '--env-prefix', bad], t.io)).toBe(2);
+      expect(JSON.parse(t.out[0])).toMatchObject({ ok: false, stage: 'args', error: 'invalid_args' });
+    }
+    const n = io({ createLarkBot: vi.fn() });
+    expect(await runCli(['--env-prefix', 'X_'], n.io)).toBe(2);
   });
 
   it('--qr-out writes the login and device-flow QR contents to a 0600 file', async () => {

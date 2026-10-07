@@ -44,6 +44,7 @@ export interface CliArgs {
   qrOut?: string;
   out?: string;
   writeEnv?: string;
+  envPrefix?: string;
   envOwnerVar?: string;
   ownerPrefix: string;
   printSecret: boolean;
@@ -115,6 +116,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
       case '--qr-out': args.qrOut = value(arg); break;
       case '--out': case '--write-credentials': args.out = value(arg); break;
       case '--write-env': args.writeEnv = value(arg); break;
+      case '--env-prefix': args.envPrefix = value(arg); break;
       case '--env-owner-var': args.envOwnerVar = value(arg); break;
       case '--owner-prefix': args.ownerPrefix = value(arg) ?? ''; break;
       case '--print-secret': args.printSecret = true; break;
@@ -130,6 +132,10 @@ export function parseCliArgs(argv: string[]): CliArgs {
   }
   for (const p of args.presets) if (!isPresetName(p)) args.errors.push(`未知 preset: ${p}（可选: ${PRESET_NAMES.join(', ')}）`);
   if (args.envOwnerVar && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(args.envOwnerVar)) args.errors.push('--env-owner-var 必须是合法的环境变量名');
+  if (args.envPrefix !== undefined) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(args.envPrefix)) args.errors.push('--env-prefix 必须匹配 /^[A-Z_][A-Z0-9_]*$/（例如 LARK_BOT_A_）');
+    else if (!args.writeEnv && args.command !== 'verify') args.errors.push('--env-prefix 需要配合 --write-env 使用');
+  }
   return args;
 }
 
@@ -166,6 +172,7 @@ export const HELP = `create-lark-bot — 一次扫码创建 / 更新 / 校验飞
 输出:
   --out <file>            凭证 JSON（0600，目录 0700）；create 默认 ./lark-app.json（给了 --write-env 时不写），update 只在显式指定时写
   --write-env <file>      就地更新 LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN（不打印值）
+  --env-prefix <P>        与 --write-env 配合：改写 <P>APP_ID / <P>APP_SECRET / <P>DOMAIN（P 匹配 [A-Z_][A-Z0-9_]*）；verify 也按此前缀读环境变量
   --env-owner-var <NAME>  同时把已验证的 owner union_id 合并写入该变量（逗号列表）
   --owner-prefix <p>      写入 owner 时加前缀（如 "lark-bot:"）
   --json                  stdout 输出机器可读结果（不含 secret），人类可读信息走 stderr
@@ -234,13 +241,14 @@ function persist(
   ownerUnionId: string | undefined,
   log: (s: string) => void,
   command: 'create' | 'update',
-): { credentialsFile?: string; envFile?: string } {
-  const written: { credentialsFile?: string; envFile?: string } = {};
+): { credentialsFile?: string; envFile?: string; envVars?: string[] } {
+  const written: { credentialsFile?: string; envFile?: string; envVars?: string[] } = {};
   if (args.writeEnv) {
+    const prefix = args.envPrefix ?? 'LARK_';
     const vars: Record<string, string | undefined> = {
-      LARK_APP_ID: creds.appId,
-      LARK_APP_SECRET: creds.appSecret,
-      LARK_DOMAIN: creds.brand,
+      [`${prefix}APP_ID`]: creds.appId,
+      [`${prefix}APP_SECRET`]: creds.appSecret,
+      [`${prefix}DOMAIN`]: creds.brand,
     };
     if (args.envOwnerVar && ownerUnionId) vars[args.envOwnerVar] = `${args.ownerPrefix}${ownerUnionId}`;
     const envPath = resolve(args.writeEnv);
@@ -248,6 +256,7 @@ function persist(
     log(`已更新 ${envPath}（${Object.keys(vars).filter(k => vars[k] !== undefined).join(', ')}；权限 0600）`);
     if (args.envOwnerVar && !ownerUnionId) log(`⚠️ 没有已验证的 owner union_id，未写入 ${args.envOwnerVar}`);
     written.envFile = envPath;
+    written.envVars = Object.keys(vars).filter(k => vars[k] !== undefined);
   }
   // A new app's secret must land somewhere, so create defaults to ./lark-app.json.
   // update only reads an existing app: it writes credentials only when asked to.
@@ -278,6 +287,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
   }
   if (args.errors.length) {
     for (const e of args.errors) io.err(`❌ ${e}`);
+    if (args.json) io.out(JSON.stringify({ ok: false, stage: 'args', error: 'invalid_args', message: args.errors.join('; ') }, null, 2));
     io.err('运行 create-lark-bot --help 查看用法。');
     return 2;
   }
@@ -320,10 +330,11 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
     try {
       if (args.credentials) creds = readCredentialsFile(resolve(args.credentials));
       else {
-        const appId = args.appId ?? io.env.LARK_APP_ID;
-        const appSecret = io.env.LARK_APP_SECRET;
-        if (!appId || !appSecret) throw new Error('缺少凭证：传 --credentials <file>，或设置 LARK_APP_ID 与 LARK_APP_SECRET');
-        creds = { appId, appSecret, brand: args.brand ?? (io.env.LARK_DOMAIN === 'lark' ? 'lark' : 'feishu') };
+        const pfx = args.envPrefix ?? 'LARK_';
+        const appId = args.appId ?? io.env[`${pfx}APP_ID`];
+        const appSecret = io.env[`${pfx}APP_SECRET`];
+        if (!appId || !appSecret) throw new Error(`缺少凭证：传 --credentials <file>，或设置 ${pfx}APP_ID 与 ${pfx}APP_SECRET`);
+        creds = { appId, appSecret, brand: args.brand ?? (io.env[`${pfx}DOMAIN`] === 'lark' ? 'lark' : 'feishu') };
       }
     } catch (err) {
       io.err(`❌ ${err instanceof Error ? err.message : String(err)}`);

@@ -46,6 +46,7 @@ npx create-lark-bot verify --credentials lark-app.json --live # 官方 API 校�
 | `--redirect-url <url>` | OAuth 重定向 URL（可重复） |
 | `--no-configure`, `--no-publish` | 跳过控制台配置 / 配置但不发版 |
 | `--out <file>` | 凭证 JSON（0600，目录 0700）。默认 `./lark-app.json`；只给 `--write-env` 时不写 |
+| `--env-prefix <P>` | 与 `--write-env` 配合：改写 `<P>APP_ID` / `<P>APP_SECRET` / `<P>DOMAIN`（P 须匹配 `^[A-Z_][A-Z0-9_]*$`，如 `LARK_BOT_A_`），用于同一 `.env` 放多个机器人；`create`/`update`/`verify` 均支持（verify 按此前缀读环境变量）；`--json` 结果的 `envVars` 列出实际写入的变量名。不给时仍是 `LARK_*` |
 | `--write-env <file>` | 就地更新 `LARK_APP_ID` / `LARK_APP_SECRET` / `LARK_DOMAIN`（=`feishu`/`lark`），保留其它行，0600，不打印值 |
 | `--env-owner-var <NAME>`, `--owner-prefix <p>` | 把**已验证的** owner union_id（加前缀）合并写入该变量（逗号列表） |
 | `--json` | stdout 输出机器可读结果（不含 secret / token），人类可读信息走 stderr |
