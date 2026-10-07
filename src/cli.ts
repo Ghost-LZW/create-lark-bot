@@ -164,7 +164,7 @@ export const HELP = `create-lark-bot — 一次扫码创建 / 更新 / 校验飞
   --no-configure          不做开放平台配置      --no-publish     配置但不发版
 
 输出:
-  --out <file>            凭证 JSON（0600，目录 0700；默认 ./lark-app.json，给了 --write-env 时默认不写）
+  --out <file>            凭证 JSON（0600，目录 0700）；create 默认 ./lark-app.json（给了 --write-env 时不写），update 只在显式指定时写
   --write-env <file>      就地更新 LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN（不打印值）
   --env-owner-var <NAME>  同时把已验证的 owner union_id 合并写入该变量（逗号列表）
   --owner-prefix <p>      写入 owner 时加前缀（如 "lark-bot:"）
@@ -233,6 +233,7 @@ function persist(
   creds: StoredCredentials,
   ownerUnionId: string | undefined,
   log: (s: string) => void,
+  command: 'create' | 'update',
 ): { credentialsFile?: string; envFile?: string } {
   const written: { credentialsFile?: string; envFile?: string } = {};
   if (args.writeEnv) {
@@ -248,7 +249,9 @@ function persist(
     if (args.envOwnerVar && !ownerUnionId) log(`⚠️ 没有已验证的 owner union_id，未写入 ${args.envOwnerVar}`);
     written.envFile = envPath;
   }
-  if (args.out || !args.writeEnv) {
+  // A new app's secret must land somewhere, so create defaults to ./lark-app.json.
+  // update only reads an existing app: it writes credentials only when asked to.
+  if (args.out || (command === 'create' && !args.writeEnv)) {
     const outPath = resolve(args.out ?? 'lark-app.json');
     writeCredentialsFile(outPath, creds);
     log(`凭证已写入 ${outPath}（权限 0600）`);
@@ -437,9 +440,9 @@ function finish(
     ...(result.owner && (result.owner.unionId || result.owner.openId)
       ? { owner: { unionId: result.owner.unionId, openId: result.owner.openId, verified: result.owner.verified } }
       : {}),
-  }, ownerUnionId, log);
+  }, ownerUnionId, log, command);
   if (args.printSecret) log(`App Secret: ${result.appSecret}`);
-  else log('AppSecret 未打印（见输出文件；需要时加 --print-secret）。');
+  else if (written.credentialsFile || written.envFile) log('AppSecret 未打印（见输出文件；需要时加 --print-secret）。');
   if (args.json) io.out(JSON.stringify(resultJson(result, written), null, 2));
   const configFailed = result.configuration && !result.configuration.ok;
   return configFailed ? 3 : 0;

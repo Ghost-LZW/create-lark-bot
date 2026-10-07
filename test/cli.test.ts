@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -108,6 +108,23 @@ describe('runCli', () => {
     const t = io({ updateLarkBot });
     expect(await runCli(['update', '--app-id', 'cli_c', '--name', 'New', '--out', join(dir, 'a.json')], t.io)).toBe(0);
     expect(updateLarkBot.mock.calls[0][0]).toMatchObject({ appId: 'cli_c', identity: { name: 'New' }, allowRescan: false });
+  });
+
+  it('update writes no credentials file unless asked; create keeps its default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const t = io({ updateLarkBot: vi.fn().mockResolvedValue({ ...created, source: 'console' }) });
+      expect(await runCli(['update', '--app-id', 'cli_c'], t.io)).toBe(0);
+      expect(existsSync(join(dir, 'lark-app.json'))).toBe(false);
+      expect(t.out.join('\n')).not.toContain(SECRET);
+      const c = io({ createLarkBot: vi.fn().mockResolvedValue(created) });
+      expect(await runCli([], c.io)).toBe(0);
+      expect(existsSync(join(dir, 'lark-app.json'))).toBe(true);
+    } finally {
+      process.chdir(cwd);
+    }
   });
 
   it('verify reads LARK_* env and returns 1 when a check fails', async () => {

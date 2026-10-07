@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+### Changed
+
+- `update` no longer writes `./lark-app.json` by default; it writes credentials only with `--out` / `--write-env`. `create` keeps the default.
+
 ## 0.2.2
 
 ### Added

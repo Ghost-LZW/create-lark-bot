@@ -1,6 +1,6 @@
 {
   "name": "create-lark-bot",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Create a fully-configured Feishu/Lark bot app with one QR scan and your own name/description/avatar: Open Platform console creation + configuration (composable scope/event presets incl. VC meeting bot, callbacks, redirect URLs, version publish), official SDK device-flow fallback, existing-app update, and official-API verify. Extracted from botmux.",
   "type": "module",
   "license": "MIT",
