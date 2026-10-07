@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- Installing from git (`npx github:Ghost-LZW/create-lark-bot`) now builds `dist/` via a `prepare` script; 0.2.0 installed without its CLI.
+
 ## 0.2.0
 
 ### Added
