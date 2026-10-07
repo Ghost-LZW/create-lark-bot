@@ -1,561 +1,559 @@
 /**
- * 开放平台自动配置（复用飞书 Web session 调 console 内部接口 `/developers/v1/*`）：
- * 导入权限（scope）、订阅事件、配置重定向 URL、创建并提交发布版本。
+ * Configure a Feishu app through the Open Platform console (reusing the Web session):
+ * redirect whitelist → scopes → privilege data ranges → bot capability + long connection →
+ * events (+ user events) → callbacks → (if anything changed / app just created) version
+ * create + publish with visibility mirrored from the online version, approval prediction,
+ * draft reuse and commit read-back.
  *
- * 仅支持飞书（feishu.cn）租户——Lark 国际版 console 机制不同。
- * 权限注册是非致命步骤：个别租户对部分权限有目录限制导致整批被拒时，
- * 只记 warning 并继续完成 redirect / 版本发布，不阻塞建 bot。
+ * Feishu (feishu.cn) only — the Lark international console differs; use the SDK flow there.
  *
- * 实现源自 botmux（https://github.com/deepcoldy/botmux，MIT）的
- * src/setup/open-platform-automation.ts。
+ * Ported from botmux (https://github.com/deepcoldy/botmux, MIT)
+ * src/setup/open-platform-automation.ts `automateOpenPlatformSetup`, including:
+ *  - 9f8a389a  events/callbacks via the console's incremental `operation:'add'` contract + read-back, fail closed on the critical ones
+ *  - 56da97f1  publishing mirrors visible/online (never resets visibility)
+ *  - a9523e10 / e861d92e / 39ecc8de / 1630fc22  skip publishing when nothing changed; granted-scope diff per bucket
+ *  - 51fc53f1 / 973b6c98  privilege data range → "same as app availability"; draft reuse; commit read-back; approval prediction
+ *  - df5f4ecf / 80474f41  redirect whitelist read-merge-write, never deletes user entries
+ *  - 34676511 et al.  under-review (code=10046) as its own non-retry reason; session-expiry detection
  */
 import {
-  MutableCookieJar,
-  type StoredCookie,
-  type WebSessionFailureReason,
-  type WebSessionSource,
-  asRecord,
+  createOpenPlatformApiClient,
+  openPlatformOwnerAccessDenied,
+  openPlatformUnderReview,
+  openPlatformWebSessionExpired,
+  type OpenPlatformApiClient,
+} from './console-client.js';
+import {
+  buildAppVersionCreatePayload,
+  buildCallbackSubscriptionPayload,
+  buildEventSubscriptionPayload,
+  buildScopeUpdatePayload,
+  extractOpenPlatformCallbackState,
+  extractOpenPlatformEventState,
+  extractOpenPlatformScopeEntries,
+  extractVersionId,
+  fetchApprovalFlowPrediction,
+  findInReviewVersionId,
+  findUncommittedDraftVersionId,
+  isVersionCommitted,
+  LONG_CONNECTION_EVENT_MODE,
+  mapManifestScopesToOpenPlatformIds,
+  missingRedirectUrls,
+  narrowRequiredPrivilegeRanges,
+  nextAppVersion,
+  writeRedirectWhitelist,
+  type OpenPlatformCallbackState,
+  type OpenPlatformEventState,
+} from './console-ops.js';
+import {
+  AUTO_REJECTED_SCOPES,
+  BOT_OPTIONAL_EVENTS,
+  classifyEventNames,
+  composePresets,
+  DEFAULT_MANIFEST,
+  type BotPreset,
+  type PresetName,
+  type ScopeManifest,
+} from './presets.js';
+import { safeErrorMessage, uniqueStrings } from './util.js';
+import { mergeVisibility, parseOnlineVisibility, VisibilityParseError, type VisibilityAdditions, type VisibilitySuggest } from './visibility.js';
+import {
   defaultSessionFilePath,
-  pickString,
   prepareWebSession,
-  safeErrorMessage,
-  uniqueStrings,
+  type WebSessionFailureReason,
   type WebSessionOptions,
+  type WebSessionSource,
 } from './web-session.js';
-import { DEFAULT_EVENTS, DEFAULT_SCOPE_MANIFEST, type ScopeManifest } from './presets.js';
 
-export interface OpenPlatformScopeEntry {
-  id: string;
-  name: string;
-  bucket?: 'tenant' | 'user';
-}
-
-export interface MappedScopeIds {
-  tenantScopeIds: string[];
-  userScopeIds: string[];
-  missingTenantScopes: string[];
-  missingUserScopes: string[];
-}
+export type ConfigureFailureReason =
+  | 'unsupported_brand'
+  | WebSessionFailureReason
+  | 'missing_csrf'
+  /** The console logged this session out: re-scan (forceQrLogin) and retry. */
+  | 'session_expired'
+  /** The signed-in account is not a collaborator of this app. */
+  | 'owner_session_mismatch'
+  | 'event_verification_failed'
+  | 'visibility_unreadable'
+  /** A version is under review (code=10046): writes are locked until it is approved/withdrawn. Do not loop. */
+  | 'app_under_review'
+  | 'network'
+  | 'api_error';
 
 export type ConfigureAppResult =
   | {
       ok: true;
       sessionFile: string;
-      sessionSource: WebSessionSource;
+      sessionSource: WebSessionSource | 'client';
       cookieCount: number;
       scopeCount: number;
       skippedScopeCount: number;
+      /** Requested scopes removed because Feishu auto-rejects publishing with them. */
+      droppedScopes: string[];
       scopeWarning?: string;
+      privilegeRangeCount: number;
+      privilegeRangeWarning?: string;
       subscribedEventCount: number;
       eventWarning?: string;
+      /** Requested events still missing after read-back (non-critical ones only; critical → ok:false). */
+      missingEvents: string[];
+      missingCallbacks: string[];
+      eventModeReady: boolean;
+      /** Every requested redirect URL is live (vacuously true when none requested). */
+      redirectConfigured: boolean;
+      redirectWarning?: string;
       versionId?: string;
+      /** Nothing changed, so no version was created (not a warning). */
+      publishSkipped?: boolean;
+      /** An existing uncommitted draft was committed instead of creating a new version. */
+      versionReused?: boolean;
+      /** Commit returned success but read-back still shows a draft (or read-back failed). */
+      versionWarning?: string;
+      /** undefined = could not be predicted. */
+      approvalAutoPassed?: boolean;
+      approvalHumanApprovers?: string[];
     }
   | {
       ok: false;
-      reason:
-        | 'unsupported_brand'
-        | WebSessionFailureReason
-        | 'missing_csrf'
-        | 'network'
-        | 'api_error';
+      reason: ConfigureFailureReason;
       message: string;
       sessionFile?: string;
       subscribedEventCount?: number;
       eventWarning?: string;
+      missingEvents?: string[];
+      eventModeReady?: boolean;
+      redirectConfigured?: boolean;
+      redirectWarning?: string;
+      /** app_under_review: the version waiting for approval, when readable. */
+      inReviewVersionId?: string;
     };
 
 export interface ConfigureAppOptions extends WebSessionOptions {
   appId: string;
   brand?: 'feishu' | 'lark';
-  /** 权限清单，默认 {@link DEFAULT_SCOPE_MANIFEST}（含完整 VC 权限）。 */
+  /** Compose scopes/events/callbacks from presets. Default: {@link DEFAULT_MANIFEST}. */
+  presets?: Array<PresetName | BotPreset>;
+  /** Scope manifest; overrides the scope part of `presets`. */
   scopeManifest?: ScopeManifest;
-  /** 订阅事件全量列表，默认 {@link DEFAULT_EVENTS}（消息基线 + VC 事件）。 */
+  /**
+   * Events (flat list, 0.1.x compatible). User-identity events and callbacks found in the
+   * list are routed to the right bucket. Overrides the event part of `presets`.
+   * The console contract is additive: events already subscribed are never removed.
+   */
   events?: string[];
-  /** OAuth 重定向 URL；为空数组/未传时跳过安全设置步骤。 */
+  /** Extra user-identity events. */
+  userEvents?: string[];
+  /** Callbacks; overrides the callback part of `presets`. */
+  callbacks?: string[];
+  /**
+   * Events/callbacks whose absence after read-back fails the run.
+   * Default: `im.message.receive_v1` and `card.action.trigger` when requested.
+   */
+  criticalEvents?: string[];
+  /** OAuth redirect URLs to ensure in the whitelist (merged; existing entries are kept). */
   redirectUrls?: string[];
-  /** 是否创建并提交发布版本，默认 true。 */
+  /** Additive visibility change applied to the published version (never narrows). */
+  visibility?: VisibilityAdditions;
+  /** Create + publish a version (only when something changed or the app was just created). Default true. */
   publishVersion?: boolean;
-  /** 版本描述信息。 */
+  /** Version change log. */
   versionRemark?: string;
+  /** Already-granted scope names per bucket: only the difference is requested. */
+  grantedScopeNames?: { tenant: string[]; user: string[] };
+  /**
+   * The app was created in this very run: always publish, and allow writing the redirect
+   * whitelist even if the (necessarily empty) live list cannot be read.
+   */
+  appJustCreated?: boolean;
+  /** Reuse an existing console client (same session) instead of preparing one. */
+  client?: OpenPlatformApiClient;
 }
 
-export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>) {
+/** Effective manifest for a configure/create run. */
+export function resolveRequestedManifest(options: Pick<ConfigureAppOptions, 'presets' | 'scopeManifest' | 'events' | 'userEvents' | 'callbacks'>) {
+  const base = options.presets ? composePresets(...options.presets) : DEFAULT_MANIFEST;
+  const classified = options.events ? classifyEventNames(options.events) : undefined;
+  const tenant = options.scopeManifest ? uniqueStrings(options.scopeManifest.scopes?.tenant ?? []) : base.scopes.tenant;
+  const user = options.scopeManifest ? uniqueStrings(options.scopeManifest.scopes?.user ?? []) : base.scopes.user;
+  const rejected = new Set<string>(AUTO_REJECTED_SCOPES);
+  const droppedScopes = uniqueStrings([...tenant, ...user].filter(name => rejected.has(name)));
   return {
-    clientId: appId,
-    appScopeIDs: mapped.tenantScopeIds,
-    userScopeIDs: mapped.userScopeIds,
-    scopeIds: [],
-    operation: 'add',
-    isDeveloperPanel: true,
-  };
-}
-
-export function buildSafeSettingPayload(appId: string, redirectUrls: string[]) {
-  return {
-    clientId: appId,
-    redirectURL: redirectUrls,
-  };
-}
-
-export function buildEventSubscriptionPayload(appId: string, events: string[]) {
-  return {
-    clientId: appId,
-    eventNames: events,
-    isDeveloperPanel: true,
-  };
-}
-
-export function buildAppVersionCreatePayload(
-  appVersion: string,
-  visibleMemberIds: string[] = [],
-  remark = 'Bot app created by create-lark-bot',
-) {
-  return {
-    appVersion,
-    mobileDefaultAbility: 'bot',
-    pcDefaultAbility: 'bot',
-    changeLog: 'Init version',
-    visibleSuggest: {
-      departments: [],
-      members: visibleMemberIds,
-      groups: [],
-      isAll: 0,
+    scopes: { tenant: tenant.filter(n => !rejected.has(n)), user: user.filter(n => !rejected.has(n)) },
+    events: {
+      app: classified ? classified.app : base.events.app,
+      user: uniqueStrings([...(classified ? classified.user : base.events.user), ...(options.userEvents ?? [])]),
     },
-    applyReasonConfig: {
-      apiPrivilegeNeedReason: true,
-      contactPrivilegeNeedReason: true,
-      dataPrivilegeReasonMap: {},
-      visibleScopeNeedReason: true,
-      apiPrivilegeReasonMap: {},
-      contactPrivilegeReason: '',
-      isDataPrivilegeExpandMap: {},
-      visibleScopeReason: '',
-      dataPrivilegeNeedReason: true,
-      isAutoAudit: false,
-      isContactExpand: false,
-    },
-    b2cShareSuggest: false,
-    autoPublish: false,
-    remark,
-    blackVisibleSuggest: {
-      departments: [],
-      members: [],
-      groups: [],
-      isAll: 0,
-    },
+    callbacks: options.callbacks
+      ? uniqueStrings(options.callbacks)
+      : uniqueStrings([...(classified && classified.callbacks.length ? classified.callbacks : base.callbacks)]),
+    droppedScopes,
   };
 }
 
-export function extractOpenPlatformCsrfToken(html: string): string | null {
-  const match =
-    html.match(/\bwindow\.csrfToken\s*=\s*(['"])([^'"]+)\1/) ??
-    html.match(/\bcsrfToken\s*:\s*(['"])([^'"]+)\1/);
-  return match?.[2] ?? null;
-}
-
-export function extractOpenPlatformScopeEntries(payload: unknown): OpenPlatformScopeEntry[] {
-  const out: OpenPlatformScopeEntry[] = [];
-  collectScopeEntries(payload, undefined, out);
-  const seen = new Set<string>();
-  return out.filter(entry => {
-    const key = `${entry.bucket ?? 'any'}:${entry.name}:${entry.id}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-export function mapManifestScopesToOpenPlatformIds(
-  manifest: ScopeManifest,
-  catalog: OpenPlatformScopeEntry[],
-): MappedScopeIds {
-  const tenant = uniqueStrings(manifest.scopes?.tenant ?? []);
-  const user = uniqueStrings(manifest.scopes?.user ?? []);
-  return {
-    tenantScopeIds: mapScopeIds(tenant, catalog, 'tenant').ids,
-    userScopeIds: mapScopeIds(user, catalog, 'user').ids,
-    missingTenantScopes: mapScopeIds(tenant, catalog, 'tenant').missing,
-    missingUserScopes: mapScopeIds(user, catalog, 'user').missing,
-  };
-}
-
-/**
- * 主入口：准备 Web session（缓存 / 扫码）→ 提取 console CSRF → 依次执行
- * 权限导入、事件订阅、安全设置、版本创建 + 发布提交。
- */
 export async function configureOpenPlatformApp(options: ConfigureAppOptions): Promise<ConfigureAppResult> {
   const brand = options.brand ?? 'feishu';
   if (brand !== 'feishu') {
-    return { ok: false, reason: 'unsupported_brand', message: '开放平台自动配置当前只支持 feishu.cn 租户' };
+    return { ok: false, reason: 'unsupported_brand', message: '开放平台自动配置当前只支持 feishu.cn 租户；Lark 请用 SDK 流程（addons）或到开放平台手动配置' };
   }
+  const appId = options.appId;
+  const requested = resolveRequestedManifest(options);
 
-  const fetcher = options.fetchImpl ?? fetch;
-  const preparedSession = await prepareWebSession({
-    sessionFilePath: options.sessionFilePath ?? defaultSessionFilePath(),
-    fallbackSessionFiles: options.fallbackSessionFiles,
-    fetchImpl: fetcher,
-    pollIntervalMs: options.pollIntervalMs,
-    maxWaitMs: options.maxWaitMs,
-    onQrCode: options.onQrCode,
-    onStatus: options.onStatus,
-  });
-  if (!preparedSession.ok) {
-    return {
-      ok: false,
-      reason: preparedSession.reason,
-      message: `获取 Feishu Web session 失败: ${preparedSession.message}`,
-      sessionFile: preparedSession.sessionFile,
-    };
-  }
-
-  const sessionFile = preparedSession.sessionFile;
-  const session = new MutableCookieJar(preparedSession.cookies);
-  const defaultOrigin = 'https://open.feishu.cn';
-  const defaultAppHome = `${defaultOrigin}/app/${options.appId}`;
-  // Web 登录得到的是可复用 cookie，不含 console 页面级 `window.csrfToken`。
-  // 带 cookie 加载一次开放平台页面提取 CSRF；部分租户会把 console 重定向到
-  // open.larkoffice.com，API origin / referer / CSRF / cookie 必须停留在最终 origin。
-  let csrfToken: string | null = null;
-  let apiOrigin = defaultOrigin;
-  let appHome = defaultAppHome;
-  try {
-    const authPage = await session.fetchTextWithUrl(fetcher, `${defaultAppHome}/auth`);
-    apiOrigin = new URL(authPage.finalUrl).origin;
-    appHome = `${apiOrigin}/app/${options.appId}`;
-    csrfToken = extractOpenPlatformCsrfToken(authPage.text);
-    if (!csrfToken) {
-      const homePage = await session.fetchTextWithUrl(fetcher, appHome);
-      apiOrigin = new URL(homePage.finalUrl).origin;
-      appHome = `${apiOrigin}/app/${options.appId}`;
-      csrfToken = extractOpenPlatformCsrfToken(homePage.text);
+  let client = options.client;
+  let sessionFile = options.sessionFilePath ?? defaultSessionFilePath();
+  let sessionSource: WebSessionSource | 'client' = 'client';
+  let cookieCount = 0;
+  if (!client) {
+    const prepared = await prepareWebSession({ ...options, sessionFilePath: sessionFile });
+    if (!prepared.ok) {
+      return { ok: false, reason: prepared.reason, message: `获取飞书 Web session 失败: ${prepared.message}`, sessionFile: prepared.sessionFile };
     }
-  } catch (err) {
-    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}`, sessionFile };
+    sessionFile = prepared.sessionFile;
+    sessionSource = prepared.source;
+    cookieCount = prepared.cookieCount;
+    const created = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl, appId });
+    if (!created.ok) {
+      return {
+        ok: false,
+        reason: created.reason,
+        message: created.reason === 'missing_csrf'
+          ? '飞书 session 可读取，但开放平台页面没有返回 window.csrfToken；需要重新扫码登录'
+          : created.message,
+        sessionFile,
+      };
+    }
+    client = created.client;
   }
-  if (!csrfToken) {
-    return {
-      ok: false,
-      reason: 'missing_csrf',
-      message: 'Feishu session 可读取，但开放平台页面没有返回 window.csrfToken；可能需要在浏览器完成开放平台登录',
-      sessionFile,
-    };
+  const postJson = client.postJson;
+  const status = async (message: string) => { await options.onStatus?.(message); };
+
+  /** Shared classification for a fatal write/read failure. */
+  const fail = (err: unknown, fallback: string, extra: Partial<Extract<ConfigureAppResult, { ok: false }>> = {}): ConfigureAppResult => {
+    if (openPlatformWebSessionExpired(err)) {
+      return { ok: false, reason: 'session_expired', message: '飞书开放平台登录态已失效，请重新扫码后重试', sessionFile, ...extra };
+    }
+    if (openPlatformOwnerAccessDenied(err)) {
+      return { ok: false, reason: 'owner_session_mismatch', message: `当前登录账号不是应用 ${appId} 的协作者（code=10003）`, sessionFile, ...extra };
+    }
+    return { ok: false, reason: 'api_error', message: `${fallback}: ${safeErrorMessage(err)}`, sessionFile, ...extra };
+  };
+
+  // 1) redirect whitelist — first, and independently: its absence is a hard OAuth failure (20029)
+  //    while every later step may bail out.
+  let mutated = false;
+  let redirectConfigured = true;
+  let redirectWarning: string | undefined;
+  const wantedRedirects = uniqueStrings(options.redirectUrls ?? []);
+  if (wantedRedirects.length > 0) {
+    redirectConfigured = false;
+    try {
+      const written = await writeRedirectWhitelist(postJson, appId, wantedRedirects, { allowBlindWrite: options.appJustCreated === true });
+      if (written.status === 'updated' || written.status === 'updated_fallback') mutated = true;
+      if (written.status === 'skipped_unreadable') {
+        redirectWarning = written.warning;
+      } else {
+        const missing = missingRedirectUrls(wantedRedirects, written.redirectUrls);
+        if (missing.length === 0) redirectConfigured = true;
+        else redirectWarning = `以下回调地址未生效: ${missing.join('、')}`;
+      }
+    } catch (err) {
+      if (openPlatformWebSessionExpired(err)) return fail(err, '');
+      redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;
+    }
   }
 
-  const postJson = createPostJson(session, fetcher, apiOrigin, appHome, csrfToken);
-
+  // 2) scopes (non-fatal: some tenants refuse a whole batch for one ungrantable scope)
   let allScopesPayload: unknown;
   try {
-    allScopesPayload = await postJson(`/developers/v1/scope/all/${options.appId}`);
+    allScopesPayload = await postJson(`/developers/v1/scope/all/${appId}`);
   } catch (err) {
-    return { ok: false, reason: 'api_error', message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`, sessionFile };
+    return fail(err, '读取开放平台 scope 列表失败', { redirectConfigured, redirectWarning });
   }
-
-  const manifest = options.scopeManifest ?? DEFAULT_SCOPE_MANIFEST;
-  const catalog = extractOpenPlatformScopeEntries(allScopesPayload);
-  const mapped = mapManifestScopesToOpenPlatformIds(manifest, catalog);
-  const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
-  const skippedScopeCount = missing.length;
-
-  let importedScopeCount = mapped.tenantScopeIds.length + mapped.userScopeIds.length;
-  let scopeWarning: string | undefined;
-  if (importedScopeCount > 0) {
-    try {
-      await postJson(`/developers/v1/scope/update/${options.appId}`, buildScopeUpdatePayload(options.appId, mapped));
-    } catch (err) {
-      scopeWarning = safeErrorMessage(err);
-      importedScopeCount = 0;
-    }
-  }
-
-  // 事件订阅（替换式接口，必须提交全量）。console 前端端点随租户/版本略有差异，
-  // 逐个尝试已知形态；全部失败仅记 warning，用户可去后台手动订阅。
-  const allEvents = options.events ?? DEFAULT_EVENTS;
-  let subscribedEventCount = 0;
-  let eventWarning: string | undefined;
-  const eventEndpoints = [
-    {
-      path: `/developers/v1/event/update/${options.appId}`,
-      body: buildEventSubscriptionPayload(options.appId, allEvents),
+  const grantedTenant = options.grantedScopeNames ? new Set(options.grantedScopeNames.tenant) : undefined;
+  const grantedUser = options.grantedScopeNames ? new Set(options.grantedScopeNames.user) : undefined;
+  const effectiveManifest: ScopeManifest = {
+    scopes: {
+      tenant: requested.scopes.tenant.filter(name => !grantedTenant?.has(name)),
+      user: requested.scopes.user.filter(name => !grantedUser?.has(name)),
     },
-    {
-      path: `/developers/v1/event/update/${options.appId}`,
-      body: { clientId: options.appId, eventNameList: allEvents, isDeveloperPanel: true },
-    },
-    {
-      path: `/developers/v1/event_callback/update/${options.appId}`,
-      body: { clientId: options.appId, eventNames: allEvents, isDeveloperPanel: true },
-    },
-  ];
-  if (allEvents.length > 0) {
-    for (const attempt of eventEndpoints) {
-      try {
-        await postJson(attempt.path, attempt.body);
-        subscribedEventCount = allEvents.length;
-        eventWarning = undefined;
-        break;
-      } catch (err) {
-        eventWarning = safeErrorMessage(err);
-      }
-    }
-  }
-
-  try {
-    const redirectUrls = options.redirectUrls ?? [];
-    if (redirectUrls.length > 0) {
-      await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId, redirectUrls));
-    }
-    let versionId: string | undefined;
-    if (options.publishVersion !== false) {
-      const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
-      const visibleMemberIds = extractContactRangeMemberIds(contactRange);
-      const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
-      const appVersion = nextAppVersion(versionList);
-      const created = await postJson(
-        `/developers/v1/app_version/create/${options.appId}`,
-        buildAppVersionCreatePayload(appVersion, visibleMemberIds, options.versionRemark),
-      );
-      versionId = extractVersionId(created);
-      if (versionId) {
-        await postJson(`/developers/v1/publish/commit/${options.appId}/${versionId}`, { clientId: options.appId });
-      }
-    }
-    return {
-      ok: true,
-      sessionFile,
-      sessionSource: preparedSession.source,
-      cookieCount: preparedSession.cookieCount,
-      scopeCount: importedScopeCount,
-      skippedScopeCount,
-      scopeWarning,
-      subscribedEventCount,
-      eventWarning,
-      versionId,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      reason: 'api_error',
-      message: `开放平台自动配置失败: ${safeErrorMessage(err)}`,
-      sessionFile,
-      subscribedEventCount,
-      eventWarning,
-    };
-  }
-}
-
-// ─── 已有应用列表 / 凭证读取 ────────────────────────────────────────────────
-
-export interface OpenPlatformAppSummary {
-  clientId: string;
-  name: string;
-  description?: string;
-}
-
-export interface OpenPlatformApiClient {
-  apiOrigin: string;
-  postJson(path: string, body?: unknown): Promise<unknown>;
-}
-
-export type OpenPlatformClientResult =
-  | { ok: true; client: OpenPlatformApiClient }
-  | { ok: false; reason: 'missing_csrf' | 'network'; message: string };
-
-/**
- * 用已就绪的 Web session cookies 构造开放平台 console API 客户端：加载 console
- * 页面提取 `window.csrfToken` 与最终 origin，返回可调 `/developers/v1/*` 的 postJson。
- */
-export async function createOpenPlatformApiClient(
-  cookies: StoredCookie[],
-  opts: { fetchImpl?: typeof fetch } = {},
-): Promise<OpenPlatformClientResult> {
-  const fetcher = opts.fetchImpl ?? fetch;
-  const session = new MutableCookieJar(cookies);
-  let csrfToken: string | null = null;
-  let apiOrigin = 'https://open.feishu.cn';
-  let referer = `${apiOrigin}/app`;
-  try {
-    const page = await session.fetchTextWithUrl(fetcher, `${apiOrigin}/app`);
-    apiOrigin = new URL(page.finalUrl).origin;
-    referer = page.finalUrl;
-    csrfToken = extractOpenPlatformCsrfToken(page.text);
-  } catch (err) {
-    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}` };
-  }
-  if (!csrfToken) {
-    return {
-      ok: false,
-      reason: 'missing_csrf',
-      message: '开放平台页面没有返回 window.csrfToken；Web session 可能已过期或未完成开放平台登录',
-    };
-  }
-  const postJson = createPostJson(session, fetcher, apiOrigin, referer, csrfToken);
-  return { ok: true, client: { apiOrigin, postJson } };
-}
-
-/** 列出当前登录人可见的自建应用（console `getAppList` 同款接口，分页拉全）。 */
-export async function listOpenPlatformApps(
-  client: OpenPlatformApiClient,
-  opts: { pageSize?: number; maxApps?: number } = {},
-): Promise<OpenPlatformAppSummary[]> {
-  const pageSize = opts.pageSize ?? 100;
-  const maxApps = opts.maxApps ?? 500;
-  const out: OpenPlatformAppSummary[] = [];
-  for (let cursor = 0; cursor < maxApps; cursor += pageSize) {
-    const payload = await client.postJson('/developers/v1/app/list', {
-      Count: pageSize,
-      Cursor: cursor,
-      QueryFilter: {},
-    });
-    const record = asRecord(payload);
-    const data = asRecord(record.data);
-    const apps = Array.isArray(data.apps) ? data.apps : Array.isArray(record.apps) ? (record.apps as unknown[]) : [];
-    for (const item of apps) {
-      const rec = asRecord(item);
-      const clientId = pickString(rec, ['clientId', 'client_id', 'appId', 'app_id', 'appID']);
-      if (!clientId || !clientId.startsWith('cli_')) continue;
-      const name = pickString(rec, ['name', 'appName', 'app_name']) ?? clientId;
-      const description = pickString(rec, ['description', 'desc', 'appDesc', 'app_desc']);
-      out.push({ clientId, name, ...(description ? { description } : {}) });
-    }
-    const totalCount = typeof data.totalCount === 'number' ? data.totalCount
-      : typeof record.totalCount === 'number' ? (record.totalCount as number) : undefined;
-    if (apps.length < pageSize) break;
-    if (totalCount !== undefined && cursor + pageSize >= totalCount) break;
-  }
-  return out;
-}
-
-/**
- * 读取指定应用的 App Secret（console `getAppSecret` 同款只读接口）。
- * 绝不触碰 /v1/secret/reset/*（会轮换 secret、打断在跑的应用）。
- */
-export async function fetchOpenPlatformAppSecret(
-  client: OpenPlatformApiClient,
-  clientId: string,
-): Promise<string> {
-  const payload = await client.postJson(`/developers/v1/secret/${clientId}`, {});
-  const record = asRecord(payload);
-  const secret = pickString(asRecord(record.data), ['secret']) ?? pickString(record, ['secret']);
-  if (!secret) throw new Error('开放平台没有返回 secret 字段');
-  return secret;
-}
-
-export class OpenPlatformApiError extends Error {
-  constructor(message: string, readonly payload: unknown) {
-    super(message);
-  }
-}
-
-function createPostJson(
-  session: MutableCookieJar,
-  fetcher: typeof fetch,
-  apiOrigin: string,
-  referer: string,
-  csrfToken: string,
-): (path: string, body?: unknown) => Promise<unknown> {
-  return async (path, body) => {
-    const url = `${apiOrigin}${path}`;
-    const response = await session.fetchRaw(fetcher, url, {
-      method: 'POST',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        origin: apiOrigin,
-        referer,
-        'x-csrf-token': csrfToken,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      data = null;
-    }
-    if (!response.ok) {
-      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizePayload(data)}`, data);
-    }
-    if (data && typeof data === 'object' && typeof data.code === 'number' && data.code !== 0) {
-      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data);
-    }
-    return data;
   };
-}
-
-function collectScopeEntries(value: unknown, bucket: 'tenant' | 'user' | undefined, out: OpenPlatformScopeEntry[]): void {
-  if (Array.isArray(value)) {
-    for (const item of value) collectScopeEntries(item, bucket, out);
-    return;
+  const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, extractOpenPlatformScopeEntries(allScopesPayload));
+  const skipped = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
+  if (skipped.length > 0) await status(`${skipped.length} 项权限不在当前租户的权限目录中，已跳过: ${skipped.slice(0, 8).join(', ')}`);
+  if (requested.droppedScopes.length > 0) {
+    await status(`已移除会导致发版被自动驳回的权限: ${requested.droppedScopes.join(', ')}`);
   }
-  if (!value || typeof value !== 'object') return;
-  const record = value as Record<string, unknown>;
-  const name = pickString(record, ['scope_name', 'scopeName', 'name', 'key', 'scopeKey']);
-  const id = pickString(record, ['id', 'scope_id', 'scopeId', 'scopeID']);
-  if (name && id) out.push({ name, id, bucket });
-  for (const [key, child] of Object.entries(record)) {
-    const nextBucket = /user/i.test(key)
-      ? 'user'
-      : /app|client|tenant/i.test(key)
-        ? 'tenant'
-        : bucket;
-    if (child && typeof child === 'object') collectScopeEntries(child, nextBucket, out);
+  let scopeCount = mapped.tenantScopeIds.length + mapped.userScopeIds.length;
+  let scopeWarning: string | undefined;
+  if (scopeCount > 0) {
+    try {
+      await postJson(`/developers/v1/scope/update/${appId}`, buildScopeUpdatePayload(appId, mapped));
+      mutated = true;
+    } catch (err) {
+      if (openPlatformWebSessionExpired(err)) return fail(err, '');
+      scopeWarning = safeErrorMessage(err);
+      scopeCount = 0;
+    }
   }
-}
 
-function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bucket: 'tenant' | 'user') {
-  const ids: string[] = [];
-  const missing: string[] = [];
-  for (const scopeName of scopeNames) {
-    const matched =
-      catalog.find(entry => entry.name === scopeName && entry.bucket === bucket) ??
-      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined) ??
-      catalog.find(entry => entry.name === scopeName);
-    if (matched) ids.push(matched.id);
-    else missing.push(scopeName);
+  // 3) privilege data ranges (non-fatal)
+  let privilegeRangeCount = 0;
+  let privilegeRangeWarning: string | undefined;
+  try {
+    privilegeRangeCount = await narrowRequiredPrivilegeRanges(postJson, appId);
+    if (privilegeRangeCount > 0) mutated = true;
+  } catch (err) {
+    privilegeRangeWarning = safeErrorMessage(err);
   }
-  return { ids: uniqueStrings(ids), missing };
-}
 
-/** 从 app_version/list 响应算下一个版本号（最新已发布 +1，无发布版 → 0.0.1）。 */
-export function nextAppVersion(payload: unknown): string {
-  const data = asRecord(asRecord(payload).data);
-  const versions = Array.isArray(data.versions) ? data.versions : [];
-  const published = versions
-    .map(item => asRecord(item))
-    .filter(item => item.versionStatus === 2)
-    .map(item => pickString(item, ['appVersion']))
-    .filter((version): version is string => Boolean(version));
-  if (published.length === 0) return '0.0.1';
-  const latest = published[0];
-  const parts = latest.split('.').map(part => Number.parseInt(part, 10));
-  if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return '0.0.1';
-  parts[parts.length - 1] += 1;
-  return parts.join('.');
-}
-
-function extractContactRangeMemberIds(payload: unknown): string[] {
-  const data = asRecord(asRecord(payload).data);
-  const detail = asRecord(data.contactRangeDetail);
-  const members = Array.isArray(detail.members) ? detail.members : [];
-  return uniqueStrings(members
-    .map(item => pickString(asRecord(item), ['id']))
-    .filter((id): id is string => Boolean(id)));
-}
-
-/** 从 app_version/create 响应提取 versionId（多种响应形态兼容）。 */
-export function extractVersionId(payload: unknown): string | undefined {
-  const direct = pickString(asRecord(payload), ['versionId', 'version_id', 'id']);
-  if (direct) return direct;
-  const data = asRecord(asRecord(payload).data);
-  return pickString(data, ['versionId', 'version_id', 'id']) ?? pickString(asRecord(data.appVersion), ['versionId', 'version_id', 'id']);
-}
-
-function summarizePayload(payload: unknown): string {
-  if (!payload || typeof payload !== 'object') return String(payload);
-  const record = payload as Record<string, unknown>;
-  const summary: Record<string, unknown> = {};
-  for (const key of ['code', 'msg', 'message', 'error', 'error_msg']) {
-    if (record[key] !== undefined) summary[key] = record[key];
+  // 4) bot capability + long connection: fatal, and the first write that does not swallow 10046.
+  try {
+    await client.postJsonIdempotent(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
+    await client.postJsonIdempotent(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: LONG_CONNECTION_EVENT_MODE });
+  } catch (err) {
+    if (openPlatformUnderReview(err)) {
+      let inReviewVersionId: string | undefined;
+      try {
+        inReviewVersionId = findInReviewVersionId(await postJson(`/developers/v1/app_version/list/${appId}`, {}));
+      } catch { /* only a throttle key */ }
+      return {
+        ok: false,
+        reason: 'app_under_review',
+        message:
+          '应用有版本正在飞书审核中，开放平台暂时锁定了配置写入（权限、机器人能力、回调白名单都改不了）。'
+          + '审批被触发通常意味着有配置不合规（最常见：权限「数据范围」是「全部」）。请到开放平台查看审批详情、修正后再撤回重提；'
+          + '直接撤回重提会被同一规则再次拦下。',
+        sessionFile,
+        redirectConfigured,
+        redirectWarning,
+        inReviewVersionId,
+      };
+    }
+    return fail(err, '启用机器人能力或长连接事件模式失败', { redirectConfigured, redirectWarning });
   }
-  return JSON.stringify(summary).slice(0, 500);
+
+  // 5) events: read → add missing (by identity bucket) → read back
+  const eventWarnings: string[] = [];
+  const readEventState = async () =>
+    extractOpenPlatformEventState(await postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }));
+  const addEvents = (appEvents: string[], userEvents: string[], eventMode: number) =>
+    postJson(`/developers/v1/event/update/${appId}`, buildEventSubscriptionPayload(appId, eventMode, appEvents, userEvents));
+  let eventState: OpenPlatformEventState | undefined;
+  try {
+    eventState = await readEventState();
+  } catch (err) {
+    if (openPlatformWebSessionExpired(err)) return fail(err, '');
+    eventWarnings.push(`读取当前事件订阅失败: ${safeErrorMessage(err)}`);
+  }
+  const hasEvent = (name: string) => Boolean(eventState?.events.includes(name));
+  const missingApp = requested.events.app.filter(name => !hasEvent(name));
+  const missingUser = requested.events.user.filter(name => !hasEvent(name));
+  if (missingApp.length > 0 || missingUser.length > 0) {
+    mutated = true;
+    const eventMode = eventState?.eventMode ?? LONG_CONNECTION_EVENT_MODE;
+    try {
+      await addEvents(missingApp, missingUser, eventMode);
+    } catch {
+      // one event whose scope is not grantable rejects the batch → add one by one
+      for (const name of missingApp) {
+        try {
+          await addEvents([name], [], eventMode);
+        } catch (err) {
+          const optional = (BOT_OPTIONAL_EVENTS as readonly string[]).includes(name) ? '（可选事件）' : '';
+          eventWarnings.push(`订阅事件 ${name} 失败${optional}: ${safeErrorMessage(err)}`);
+        }
+      }
+      for (const name of missingUser) {
+        try {
+          await addEvents([], [name], eventMode);
+        } catch (err) {
+          eventWarnings.push(`订阅事件 ${name} 失败: ${safeErrorMessage(err)}`);
+        }
+      }
+    }
+    try {
+      eventState = await readEventState();
+    } catch (err) {
+      eventWarnings.push(`回读事件订阅失败: ${safeErrorMessage(err)}`);
+    }
+  }
+  const wantedEvents = [...requested.events.app, ...requested.events.user];
+  const missingEvents = wantedEvents.filter(name => !hasEvent(name));
+  if (missingEvents.length > 0) eventWarnings.push(`事件未确认订阅: ${missingEvents.join(', ')}`);
+
+  // 6) callbacks (card.action.trigger lives under /callback/*, with its own receive mode)
+  const readCallbackState = async () => extractOpenPlatformCallbackState(await postJson(`/developers/v1/callback/${appId}`, {}));
+  let callbackState: OpenPlatformCallbackState | undefined;
+  let missingCallbacks: string[] = [];
+  if (requested.callbacks.length > 0) {
+    try {
+      callbackState = await readCallbackState();
+    } catch (err) {
+      eventWarnings.push(`读取当前回调订阅失败: ${safeErrorMessage(err)}`);
+    }
+    if (callbackState && callbackState.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+      mutated = true;
+      try {
+        await postJson(`/developers/v1/callback/switch/${appId}`, { clientId: appId, callbackMode: LONG_CONNECTION_EVENT_MODE });
+        callbackState = await readCallbackState();
+      } catch (err) {
+        eventWarnings.push(`切换回调长连接模式失败: ${safeErrorMessage(err)}`);
+      }
+    }
+    missingCallbacks = requested.callbacks.filter(name => !callbackState?.callbacks.includes(name));
+    if (missingCallbacks.length > 0) {
+      mutated = true;
+      try {
+        await postJson(
+          `/developers/v1/callback/update/${appId}`,
+          buildCallbackSubscriptionPayload(appId, callbackState?.callbackMode ?? LONG_CONNECTION_EVENT_MODE, missingCallbacks),
+        );
+      } catch (err) {
+        eventWarnings.push(`订阅回调失败: ${safeErrorMessage(err)}`);
+      }
+      try {
+        callbackState = await readCallbackState();
+      } catch (err) {
+        eventWarnings.push(`回读回调订阅失败: ${safeErrorMessage(err)}`);
+      }
+      missingCallbacks = requested.callbacks.filter(name => !callbackState?.callbacks.includes(name));
+    }
+  }
+
+  const subscribedEventCount = wantedEvents.filter(hasEvent).length
+    + requested.callbacks.filter(name => callbackState?.callbacks.includes(name)).length;
+  const eventWarning = eventWarnings.length > 0 ? eventWarnings.join('; ') : undefined;
+  const eventModeReady = eventState?.eventMode === LONG_CONNECTION_EVENT_MODE;
+  const critical = options.criticalEvents ?? ['im.message.receive_v1', 'card.action.trigger'];
+  const criticalIssues = [
+    ...critical.filter(name => wantedEvents.includes(name) && !hasEvent(name)),
+    ...critical.filter(name => missingCallbacks.includes(name)),
+  ];
+  if (!eventModeReady) criticalIssues.push(`事件接收模式=${eventState?.eventMode ?? '未知'}（需长连接 ${LONG_CONNECTION_EVENT_MODE}）`);
+  if (requested.callbacks.length > 0 && callbackState?.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    criticalIssues.push(`回调接收模式=${callbackState?.callbackMode ?? '未知'}（需长连接 ${LONG_CONNECTION_EVENT_MODE}）`);
+  }
+  if (criticalIssues.length > 0) {
+    return {
+      ok: false,
+      reason: 'event_verification_failed',
+      message: `核心事件/回调订阅未生效（${criticalIssues.join('; ')}），机器人将收不到消息或卡片点击；请到开放平台「事件与回调」手动补齐后重试`,
+      sessionFile,
+      subscribedEventCount,
+      eventWarning,
+      missingEvents,
+      eventModeReady,
+      redirectConfigured,
+      redirectWarning,
+    };
+  }
+
+  const base = {
+    ok: true as const,
+    sessionFile,
+    sessionSource,
+    cookieCount,
+    scopeCount,
+    skippedScopeCount: skipped.length,
+    droppedScopes: requested.droppedScopes,
+    scopeWarning,
+    privilegeRangeCount,
+    privilegeRangeWarning,
+    subscribedEventCount,
+    eventWarning,
+    missingEvents,
+    missingCallbacks,
+    eventModeReady,
+    redirectConfigured,
+    redirectWarning,
+  };
+  if (options.publishVersion === false) return base;
+
+  // 7) publish — skipped when nothing changed, unless just created / a draft is stuck / visibility requested.
+  let versionList: unknown;
+  try {
+    versionList = await postJson(`/developers/v1/app_version/list/${appId}`, {});
+  } catch (err) {
+    await status(`读取版本列表失败（${safeErrorMessage(err)}），跳过草稿检查`);
+  }
+  const pendingDraft = versionList === undefined ? undefined : findUncommittedDraftVersionId(versionList);
+  const mustPublish = options.appJustCreated === true || options.visibility !== undefined;
+  if (!mutated && !mustPublish && !pendingDraft) {
+    return { ...base, publishSkipped: true };
+  }
+
+  try {
+    let visibility: { visibleSuggest: VisibilitySuggest; blackVisibleSuggest: VisibilitySuggest };
+    try {
+      visibility = parseOnlineVisibility(await postJson(`/developers/v1/visible/online/${appId}`, {}));
+    } catch (err) {
+      if (!(err instanceof VisibilityParseError)) throw err;
+      return {
+        ok: false,
+        reason: 'visibility_unreadable',
+        message: `无法可靠读取应用现有可见范围（${err.message}），已中止发版以免重置可见范围；请到开放平台手动发布新版本`,
+        sessionFile,
+        subscribedEventCount,
+        eventWarning,
+        missingEvents,
+        eventModeReady,
+        redirectConfigured,
+        redirectWarning,
+      };
+    }
+    visibility = { ...visibility, visibleSuggest: mergeVisibility(visibility.visibleSuggest, options.visibility) };
+    const versions = versionList ?? await postJson(`/developers/v1/app_version/list/${appId}`, {});
+    const draftVersionId = findUncommittedDraftVersionId(versions);
+    let versionId: string | undefined;
+    let versionReused = false;
+    if (draftVersionId) {
+      // A draft blocks create (code=10043). Its scope set is the app's current declared set,
+      // which already includes what scope/update just added: commit it.
+      versionId = draftVersionId;
+      versionReused = true;
+    } else {
+      const payload = buildAppVersionCreatePayload(nextAppVersion(versions), [], options.versionRemark ?? 'Update bot configuration.') as unknown as Record<string, unknown>;
+      payload.visibleSuggest = visibility.visibleSuggest;
+      payload.blackVisibleSuggest = visibility.blackVisibleSuggest;
+      versionId = extractVersionId(await postJson(`/developers/v1/app_version/create/${appId}`, payload));
+    }
+    let versionWarning: string | undefined;
+    let approvalAutoPassed: boolean | undefined;
+    let approvalHumanApprovers: string[] | undefined;
+    if (versionId) {
+      const prediction = await fetchApprovalFlowPrediction(postJson, appId, versionId, visibility);
+      if (prediction.known) {
+        approvalAutoPassed = prediction.autoApproved;
+        if (prediction.humanApprovers.length > 0) approvalHumanApprovers = prediction.humanApprovers;
+      } else if (prediction.reason) {
+        await status(`审批流程预判不可用（${prediction.reason}），按常规提交`);
+      }
+      await postJson(`/developers/v1/publish/commit/${appId}/${versionId}`, { clientId: appId });
+      try {
+        if (!isVersionCommitted(await postJson(`/developers/v1/app_version/list/${appId}`, {}), versionId)) {
+          versionWarning = `版本 ${versionId} 提交后回读仍是草稿：请到开放平台「版本管理」手动点「申请发布」`;
+        }
+      } catch (err) {
+        versionWarning = `版本 ${versionId} 提交状态回读失败（无法确认是否已提交）: ${safeErrorMessage(err)}`;
+      }
+    } else {
+      versionWarning = '开放平台没有返回新版本 versionId，可能留下了未提交的草稿';
+    }
+    return { ...base, versionId, versionReused, versionWarning, approvalAutoPassed, approvalHumanApprovers };
+  } catch (err) {
+    if (openPlatformUnderReview(err)) {
+      return {
+        ok: false,
+        reason: 'app_under_review',
+        message: '应用有版本正在审核中，暂时无法创建/提交新版本；审批结束后重试',
+        sessionFile,
+        subscribedEventCount,
+        eventWarning,
+        missingEvents,
+        eventModeReady,
+        redirectConfigured,
+        redirectWarning,
+      };
+    }
+    return fail(err, '开放平台发版失败', { subscribedEventCount, eventWarning, missingEvents, eventModeReady, redirectConfigured, redirectWarning });
+  }
 }

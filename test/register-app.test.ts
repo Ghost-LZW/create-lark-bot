@@ -13,7 +13,8 @@ vi.mock('qrcode-terminal', () => ({
 }));
 
 import { registerApp } from '@larksuiteoapi/node-sdk';
-import { registerLarkApp } from '../src/register-app.js';
+import { buildSdkAddons, buildSdkAppPreset, registerLarkApp } from '../src/register-app.js';
+import { composePresets } from '../src/presets.js';
 
 const mockedRegisterApp = registerApp as unknown as ReturnType<typeof vi.fn>;
 
@@ -110,5 +111,53 @@ describe('registerLarkApp', () => {
     const r = await registerLarkApp({ onQRCodeReady: () => {}, onStatusChange: () => {} });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('unknown');
+  });
+
+  it('passes appPreset / addons / appId / createOnly through to the SDK', async () => {
+    mockedRegisterApp.mockResolvedValue({ client_id: 'cli_x', client_secret: 'sec', user_info: {} });
+    const addons = buildSdkAddons(composePresets('messagingCore'));
+    await registerLarkApp({
+      onQRCodeReady: () => {},
+      appPreset: { name: "{user}'s bot", desc: 'd', avatar: 'https://img.example/a.png' },
+      addons,
+      createOnly: true,
+    });
+    expect(mockedRegisterApp.mock.calls[0][0]).toMatchObject({
+      appPreset: { name: "{user}'s bot", desc: 'd', avatar: 'https://img.example/a.png' },
+      addons: {
+        scopes: { tenant: ['im:message:send_as_bot', 'im:message', 'im:message.p2p_msg:readonly', 'im:message.group_at_msg:readonly'] },
+        events: { items: { tenant: ['im.message.receive_v1'] } },
+        callbacks: { items: ['card.action.trigger'] },
+      },
+      createOnly: true,
+    });
+    expect(mockedRegisterApp.mock.calls[0][0]).not.toHaveProperty('appId');
+
+    await registerLarkApp({ onQRCodeReady: () => {}, appId: 'cli_existing' });
+    expect(mockedRegisterApp.mock.calls[1][0]).toMatchObject({ appId: 'cli_existing' });
+  });
+});
+
+describe('SDK preset/addons builders', () => {
+  it('maps identity to appPreset; local avatars are reported, not passed', () => {
+    expect(buildSdkAppPreset({ name: ' Bot ', description: 'D', avatar: 'https://img.example/a.png' })).toEqual({
+      appPreset: { name: 'Bot', desc: 'D', avatar: 'https://img.example/a.png' }, warnings: [],
+    });
+    const local = buildSdkAppPreset({ avatar: './me.png' });
+    expect(local.appPreset).toBeUndefined();
+    expect(local.warnings[0]).toMatch(/URL/);
+    expect(buildSdkAppPreset(undefined)).toEqual({ warnings: [] });
+  });
+
+  it('maps a manifest to addons with user buckets; empty → undefined unless preset:false', () => {
+    const addons = buildSdkAddons(composePresets('vcMeeting'));
+    expect(addons?.events?.items).toEqual({
+      tenant: ['vc.bot.meeting_invited_v1', 'vc.bot.meeting_activity_v1', 'vc.bot.meeting_ended_v1'],
+      user: ['vc.meeting.participant_meeting_joined_v1'],
+    });
+    expect(addons?.scopes?.user).toEqual(['vc:meeting.meetingevent:read']);
+    const empty = composePresets();
+    expect(buildSdkAddons(empty)).toBeUndefined();
+    expect(buildSdkAddons(empty, { preset: false })).toEqual({ preset: false });
   });
 });

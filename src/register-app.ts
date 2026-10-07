@@ -1,5 +1,10 @@
 /**
- * 飞书扫码建应用（第一个二维码）— 对接 `@larksuiteoapi/node-sdk` 的 `registerApp`。
+ * 兼容模式：官方 SDK device flow 扫码建应用 — 对接 `@larksuiteoapi/node-sdk` 的 `registerApp`
+ * （≥ 1.74：`appPreset` 预填名称/描述/头像 URL，`addons` 预填 scopes/events/callbacks，
+ * `appId` 走「更新已有应用」，`createOnly` 隐藏「选择已有应用」入口）。
+ *
+ * 主路径是 {@link createFeishuOpenPlatformApp}（控制台单 Web session）；这里用于 Lark
+ * 国际版租户以及控制台路径不可用时的回退。
  *
  * 走 OAuth 2.0 Device Flow (RFC 8628):
  *   1. SDK 向 `accounts.feishu.cn/oauth/v1/app/registration` 发 `action=begin`
@@ -19,6 +24,63 @@
  */
 import { registerApp } from '@larksuiteoapi/node-sdk';
 import qrcode from 'qrcode-terminal';
+import { isHttpUrl, type AppIdentity } from './identity.js';
+import type { BotManifest } from './presets.js';
+import { redactSecrets } from './util.js';
+
+/** SDK `AppPreset`: pre-filled on the creation page; the user may still edit it. */
+export interface SdkAppPreset {
+  /** 1–6 publicly reachable image URLs (png/jpg/jpeg/webp/gif); the first is selected. */
+  avatar?: string | string[];
+  /** Supports `{user}` (replaced with the scanning user's name by the platform). */
+  name?: string;
+  /** Supports `{user}`. */
+  desc?: string;
+}
+
+/** SDK `AppAddons`: additive scopes/events/callbacks shown on the confirm page. */
+export interface SdkAppAddons {
+  /** false = drop the platform default template (minimal base: bot capability only). */
+  preset?: boolean;
+  scopes?: { tenant?: string[]; user?: string[] };
+  events?: { items?: { tenant?: string[]; user?: string[] } };
+  callbacks?: { items?: string[] };
+}
+
+/**
+ * Map an {@link AppIdentity} to the SDK `appPreset`. Only URL avatars can be passed (the
+ * platform page fetches them); a local file / bytes avatar is reported in `warnings`.
+ */
+export function buildSdkAppPreset(identity: AppIdentity | undefined): { appPreset?: SdkAppPreset; warnings: string[] } {
+  const warnings: string[] = [];
+  if (!identity) return { warnings };
+  const preset: SdkAppPreset = {};
+  if (identity.name?.trim()) preset.name = identity.name.trim();
+  if (identity.description?.trim()) preset.desc = identity.description.trim();
+  if (identity.avatar !== undefined) {
+    if (typeof identity.avatar === 'string' && isHttpUrl(identity.avatar)) preset.avatar = identity.avatar.trim();
+    else warnings.push('兼容模式（SDK device flow）只接受公网可访问的头像 URL；本地头像文件已忽略，可稍后用 update 流程设置');
+  }
+  return { appPreset: Object.keys(preset).length > 0 ? preset : undefined, warnings };
+}
+
+/** Map a composed manifest to SDK `addons` (undefined when empty, which the SDK rejects). */
+export function buildSdkAddons(manifest: Pick<BotManifest, 'scopes' | 'events' | 'callbacks'>, opts: { preset?: boolean } = {}): SdkAppAddons | undefined {
+  const addons: SdkAppAddons = {};
+  if (opts.preset !== undefined) addons.preset = opts.preset;
+  const tenant = manifest.scopes.tenant;
+  const user = manifest.scopes.user;
+  if (tenant.length || user.length) addons.scopes = { ...(tenant.length ? { tenant: [...tenant] } : {}), ...(user.length ? { user: [...user] } : {}) };
+  const appEvents = manifest.events.app;
+  const userEvents = manifest.events.user;
+  if (appEvents.length || userEvents.length) {
+    addons.events = { items: { ...(appEvents.length ? { tenant: [...appEvents] } : {}), ...(userEvents.length ? { user: [...userEvents] } : {}) } };
+  }
+  if (manifest.callbacks.length) addons.callbacks = { items: [...manifest.callbacks] };
+  const hasItems = Boolean(addons.scopes || addons.events || addons.callbacks);
+  if (!hasItems && addons.preset !== false) return undefined;
+  return addons;
+}
 
 export type RegisterBrand = 'feishu' | 'lark';
 
@@ -59,6 +121,14 @@ export interface RegisterAppOptions {
   onQRCodeReady?: (info: { url: string; expireIn: number }) => void;
   /** 状态变更回调, 主要用于"已切换到 Lark 域名"提示。 */
   onStatusChange?: (info: { status: string; interval?: number }) => void;
+  /** 创建页预填的名称/描述/头像 URL（SDK `appPreset`）。 */
+  appPreset?: SdkAppPreset;
+  /** 确认页预填的增量 scopes/events/callbacks（SDK `addons`；平台灰度未开时被忽略）。 */
+  addons?: SdkAppAddons;
+  /** 更新已有应用（cli_xxx）的配置而不是新建：确认页展示 addons 带来的差异。 */
+  appId?: string;
+  /** 只允许新建（隐藏「选择已有应用」入口）；优先于 appId。 */
+  createOnly?: boolean;
 }
 
 function defaultPrintQRCode(info: { url: string; expireIn: number }): void {
@@ -93,6 +163,10 @@ export async function registerLarkApp(opts: RegisterAppOptions = {}): Promise<Re
       source: opts.source ?? 'create-lark-bot',
       onQRCodeReady: onQR,
       onStatusChange: onStatus,
+      ...(opts.appPreset ? { appPreset: opts.appPreset } : {}),
+      ...(opts.addons ? { addons: opts.addons } : {}),
+      ...(opts.appId ? { appId: opts.appId } : {}),
+      ...(opts.createOnly !== undefined ? { createOnly: opts.createOnly } : {}),
     });
 
     if (!result.client_id || !result.client_secret) {
@@ -111,7 +185,7 @@ export async function registerLarkApp(opts: RegisterAppOptions = {}): Promise<Re
     const code: string = err?.code ?? '';
     const rawMsg: string = err?.message ?? String(err);
     // SDK 不会把 secret 放进 message, 但保险起见再过一次
-    const safeMsg = rawMsg.replace(/[a-zA-Z0-9_-]{30,}/g, '***');
+    const safeMsg = redactSecrets(rawMsg);
 
     if (code === 'abort') return { ok: false, error: 'aborted', message: '用户取消扫码' };
     if (code === 'expired_token') return { ok: false, error: 'expired', message: '二维码已过期, 请重试' };

@@ -8,7 +8,7 @@ export type CredentialValidation =
   | { ok: true; tenantAccessToken: string; tokenExpiresIn: number }
   | { ok: false; error: 'invalid_credentials' | 'network' | 'unknown'; message: string };
 
-function openApiOrigin(brand: RegisterBrand): string {
+export function openApiOrigin(brand: RegisterBrand): string {
   return brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
 }
 
@@ -16,7 +16,7 @@ export async function validateCredentials(
   appId: string,
   appSecret: string,
   brand: RegisterBrand = 'feishu',
-  opts: { budgetMs?: number; signal?: AbortSignal } = {},
+  opts: { budgetMs?: number; signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
 ): Promise<CredentialValidation> {
   const budgetMs = opts.budgetMs ?? 10_000;
   const url = `${openApiOrigin(brand)}/open-apis/auth/v3/tenant_access_token/internal`;
@@ -32,7 +32,7 @@ export async function validateCredentials(
   let res: Response;
   let body: any;
   try {
-    res = await fetch(url, {
+    res = await (opts.fetchImpl ?? fetch)(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       // 这是飞书唯一接受 appSecret 的端点; 不要把 secret 拼进 query string 或日志。

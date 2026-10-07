@@ -1,7 +1,7 @@
 {
   "name": "create-lark-bot",
-  "version": "0.1.0",
-  "description": "Create a fully-configured Feishu/Lark bot app with just two QR scans: device-flow app creation + Open Platform auto-configuration (scopes incl. VC meeting bot, event subscriptions, redirect URL, version publish). Extracted from botmux.",
+  "version": "0.2.0",
+  "description": "Create a fully-configured Feishu/Lark bot app with one QR scan and your own name/description/avatar: Open Platform console creation + configuration (composable scope/event presets incl. VC meeting bot, callbacks, redirect URLs, version publish), official SDK device-flow fallback, existing-app update, and official-API verify. Extracted from botmux.",
   "type": "module",
   "license": "MIT",
   "author": "Ghost-LZW",
@@ -26,7 +26,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18"
@@ -37,16 +38,18 @@
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "keywords": [
+    "bot",
+    "device-flow",
     "feishu",
     "lark",
-    "bot",
+    "meeting-bot",
     "open-platform",
     "qrcode",
     "vc",
-    "meeting-bot"
+    "verify"
   ],
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@larksuiteoapi/node-sdk": "^1.74.0",
     "qrcode-terminal": "^0.12.0"
   },
   "pnpm": {

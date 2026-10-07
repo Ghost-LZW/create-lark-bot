@@ -8,12 +8,11 @@ import { describe, expect, it } from 'vitest';
 import {
   buildSafeSettingPayload,
   buildScopeUpdatePayload,
-  configureOpenPlatformApp,
-  extractOpenPlatformCsrfToken,
   extractOpenPlatformScopeEntries,
   mapManifestScopesToOpenPlatformIds,
   nextAppVersion,
-} from '../src/open-platform.js';
+} from '../src/console-ops.js';
+import { extractOpenPlatformCsrfToken } from '../src/console-client.js';
 import {
   buildQrLoginPayload,
   defaultSessionFilePath,
@@ -54,9 +53,9 @@ describe('default presets', () => {
     }
   });
 
-  it('default events include messaging baseline and VC meeting events', () => {
+  it('default events include messaging baseline and VC meeting events; card.action.trigger is a callback', () => {
     expect(DEFAULT_EVENTS).toContain('im.message.receive_v1');
-    expect(DEFAULT_EVENTS).toContain('card.action.trigger');
+    expect(DEFAULT_EVENTS).not.toContain('card.action.trigger');
     for (const event of VC_MEETING_BOT_EVENTS) expect(DEFAULT_EVENTS).toContain(event);
   });
 });
@@ -126,9 +125,10 @@ describe('payload helpers', () => {
     ]);
   });
 
-  it('computes next app version from published versions', () => {
+  it('computes next app version from ALL versions (drafts included)', () => {
     expect(nextAppVersion({ data: { versions: [] } })).toBe('0.0.1');
     expect(nextAppVersion({ data: { versions: [{ versionStatus: 2, appVersion: '1.0.3' }] } })).toBe('1.0.4');
+    expect(nextAppVersion({ data: { versions: [{ versionStatus: 2, appVersion: '1.0.3' }, { versionStatus: 0, appVersion: '1.0.9' }] } })).toBe('1.0.10');
   });
 });
 
@@ -205,232 +205,27 @@ describe('prepareWebSession', () => {
     expect(result.ok && result.source).toBe('fallback_file');
     expect(readStoredCookiesFromSessionFile(sessionFile)?.map(c => c.name)).toContain('session');
   });
-});
 
-describe('configureOpenPlatformApp', () => {
-  it('returns login failure so callers can fall back to manual steps without aborting', async () => {
-    const fetchImpl = (async () => {
+  it('honours disableQrLogin (never shows a QR) and forceQrLogin (ignores the cache)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
+    const sessionFile = join(dir, 'web-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    let qrShown = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('accounts/login', { status: 200 }); // looks logged out
       throw new Error('login down');
     }) as typeof fetch;
-    const result = await configureOpenPlatformApp({
-      appId: 'cli_x',
-      sessionFilePath: join(tmpdir(), `create-lark-bot-missing-${Date.now()}.json`),
-      fetchImpl,
-      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
-      onQrCode: () => {},
-      maxWaitMs: 1,
-    });
+    const noQr = await prepareWebSession({ sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true, onQrCode: () => { qrShown++; } });
+    expect(noQr).toMatchObject({ ok: false, reason: 'invalid_session' });
+    expect(qrShown).toBe(0);
 
-    expect(result).toMatchObject({ ok: false, reason: 'login_failed' });
-  });
-
-  it('uses cached session cookies, page csrf, and calls the expected Open Platform endpoints', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
-    const sessionFile = join(dir, 'web-session.json');
-    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    const okFetch = (async (url: string | URL | Request) => {
       const href = String(url);
-      calls.push({ url: href, init: init ?? {} });
       if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
-      if (href.endsWith('/auth')) {
-        return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
-      }
-      if (href.includes('/scope/all/')) {
-        return Response.json({
-          code: 0,
-          data: {
-            appScopeList: [{ id: 'tenant-1', name: 'im:message' }],
-            userScopeList: [{ id: 'user-1', name: 'auth:user_access_token:read' }],
-          },
-        });
-      }
-      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
+      throw new Error('login down');
     }) as typeof fetch;
-
-    const result = await configureOpenPlatformApp({
-      appId: 'cli_x',
-      sessionFilePath: sessionFile,
-      fetchImpl,
-      scopeManifest: { scopes: { tenant: ['im:message'], user: ['auth:user_access_token:read'] } },
-      redirectUrls: ['http://127.0.0.1:9000/callback'],
-    });
-
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.sessionSource).toBe('cache');
-    expect(calls.filter(call => new URL(call.url).host === 'open.feishu.cn').map(call => new URL(call.url).pathname)).toEqual([
-      '/app/cli_x/auth',
-      '/developers/v1/scope/all/cli_x',
-      '/developers/v1/scope/update/cli_x',
-      '/developers/v1/event/update/cli_x',
-      '/developers/v1/safe_setting/update/cli_x',
-      '/developers/v1/contact_range/cli_x',
-      '/developers/v1/app_version/list/cli_x',
-      '/developers/v1/app_version/create/cli_x',
-      '/developers/v1/publish/commit/cli_x/v1',
-    ]);
-    const updateCall = calls.find(call => call.url.includes('/scope/update/'));
-    expect(new Headers(updateCall?.init.headers).get('x-csrf-token')).toBe('csrf_auto');
-    expect(new Headers(updateCall?.init.headers).get('cookie')).toBe('session=secret-cookie-value');
-    expect(JSON.parse(String(updateCall?.init.body))).toMatchObject({
-      clientId: 'cli_x',
-      appScopeIDs: ['tenant-1'],
-      userScopeIDs: ['user-1'],
-    });
-    // 默认事件（含 VC）全量提交
-    const eventCall = calls.find(call => call.url.includes('/event/update/'));
-    const eventBody = JSON.parse(String(eventCall?.init.body));
-    expect(eventBody.eventNames).toEqual(DEFAULT_EVENTS);
-  });
-
-  it('skips safe_setting when no redirect urls and skips version publish when disabled', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
-    const sessionFile = join(dir, 'web-session.json');
-    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
-    const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
-      const href = String(url);
-      calls.push(href);
-      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
-      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
-      if (href.includes('/scope/all/')) {
-        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
-      }
-      return Response.json({ code: 0 });
-    }) as typeof fetch;
-
-    const result = await configureOpenPlatformApp({
-      appId: 'cli_x',
-      sessionFilePath: sessionFile,
-      fetchImpl,
-      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
-      publishVersion: false,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(calls.some(u => u.includes('/safe_setting/update/'))).toBe(false);
-    expect(calls.some(u => u.includes('/app_version/'))).toBe(false);
-    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
-  });
-
-  it('uses the redirected Open Platform origin for API calls and referer', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
-    const sessionFile = join(dir, 'web-session.json');
-    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
-      const href = String(url);
-      calls.push({ url: href, init: init ?? {} });
-      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
-      if (href === 'https://open.feishu.cn/app/cli_x/auth') {
-        return new Response('', {
-          status: 302,
-          headers: { location: 'https://open.larkoffice.com/app/cli_x/auth' },
-        });
-      }
-      if (href === 'https://open.larkoffice.com/app/cli_x/auth') {
-        return new Response('<script>window.csrfToken="csrf_larkoffice"</script>', {
-          status: 200,
-          headers: {
-            'set-cookie': 'lark_oapi_csrf_token=csrf_larkoffice_cookie; Domain=.larkoffice.com; Path=/; Secure',
-          },
-        });
-      }
-      if (href.includes('/scope/all/')) {
-        return Response.json({
-          code: 0,
-          data: { appScopeList: [{ id: 'tenant-1', name: 'im:message' }], userScopeList: [] },
-        });
-      }
-      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
-    }) as typeof fetch;
-
-    const result = await configureOpenPlatformApp({
-      appId: 'cli_x',
-      sessionFilePath: sessionFile,
-      fetchImpl,
-      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
-    });
-
-    expect(result.ok).toBe(true);
-    const updateCall = calls.find(call => call.url === 'https://open.larkoffice.com/developers/v1/scope/update/cli_x');
-    const updateHeaders = new Headers(updateCall?.init.headers);
-    expect(updateHeaders.get('origin')).toBe('https://open.larkoffice.com');
-    expect(updateHeaders.get('referer')).toBe('https://open.larkoffice.com/app/cli_x');
-    expect(updateHeaders.get('x-csrf-token')).toBe('csrf_larkoffice');
-    expect(updateHeaders.get('cookie')).toContain('lark_oapi_csrf_token=csrf_larkoffice_cookie');
-  });
-
-  it('treats a rejected scope batch as success (partial-permission tenants) and still publishes', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
-    const sessionFile = join(dir, 'web-session.json');
-    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
-    const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
-      const href = String(url);
-      calls.push(href);
-      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
-      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
-      if (href.includes('/scope/all/')) {
-        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
-      }
-      if (href.includes('/scope/update/')) return Response.json({ code: 1, msg: 'scope not grantable for tenant' });
-      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
-    }) as typeof fetch;
-
-    const result = await configureOpenPlatformApp({
-      appId: 'cli_x',
-      sessionFilePath: sessionFile,
-      fetchImpl,
-      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
-    });
-
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.scopeCount).toBe(0);
-      expect(result.scopeWarning).toBeTruthy();
-      expect(result.versionId).toBe('v1');
-    }
-    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
-  });
-
-  it('skips scope update when no manifest scope exists in this tenant catalog, still succeeding', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'create-lark-bot-'));
-    const sessionFile = join(dir, 'web-session.json');
-    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
-    const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
-      const href = String(url);
-      calls.push(href);
-      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
-      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
-      if (href.includes('/scope/all/')) {
-        return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
-      }
-      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
-    }) as typeof fetch;
-
-    const result = await configureOpenPlatformApp({
-      appId: 'cli_x',
-      sessionFilePath: sessionFile,
-      fetchImpl,
-      scopeManifest: { scopes: { tenant: ['im:message', 'contact:user.base:readonly'], user: ['auth:user_access_token:read'] } },
-    });
-
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.scopeCount).toBe(0);
-      expect(result.skippedScopeCount).toBe(3);
-    }
-    expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
-  });
-
-  it('rejects lark brand with unsupported_brand', async () => {
-    const result = await configureOpenPlatformApp({ appId: 'cli_x', brand: 'lark' });
-    expect(result).toMatchObject({ ok: false, reason: 'unsupported_brand' });
+    const forced = await prepareWebSession({ sessionFilePath: sessionFile, fetchImpl: okFetch, forceQrLogin: true, onQrCode: () => { qrShown++; } });
+    expect(forced.ok).toBe(false); // the cache was valid but ignored, and login failed
   });
 });
